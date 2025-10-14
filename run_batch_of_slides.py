@@ -6,12 +6,19 @@ python run_batch_of_slides.py --task all --wsi_dir output/wsis --job_dir output 
 ```
 
 """
-import os
 import argparse
-import torch
-from typing import Any
+import csv
+import os
+import shutil
+from queue import Queue
+from threading import Thread
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from trident import Processor 
+import torch
+
+from trident import Processor
+from trident.Concurrency import cache_batch
+from trident.IO import collect_valid_slides
 from trident.patch_encoder_models import encoder_registry as patch_encoder_registry
 from trident.slide_encoder_models import encoder_registry as slide_encoder_registry
 
@@ -28,7 +35,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Run Trident')
 
     # Generic arguments 
-    parser.add_argument('--gpu', type=int, default=0, help='GPU index to use for processing tasks.')
+    parser.add_argument('--gpu', '--gpus', dest='gpus', type=int, nargs='+', default=[0],
+                        help='GPU indices to use for processing tasks. Provide one or multiple space-separated indices (e.g. --gpus 0 1).')
     parser.add_argument('--task', type=str, default='seg', 
                         choices=['seg', 'coords', 'feat', 'all'], 
                         help='Task to run: seg (segmentation), coords (save tissue coordinates), img (save tissue images), feat (extract features).')
@@ -140,6 +148,183 @@ def generate_help_text() -> str:
     return parser.format_help()
 
 
+def clone_args(base_args: argparse.Namespace, **overrides: Any) -> argparse.Namespace:
+    """
+    Return a shallow copy of the provided namespace with updates applied."""
+
+    data = vars(base_args).copy()
+    data.update(overrides)
+    return argparse.Namespace(**data)
+
+
+def resolve_devices(args: argparse.Namespace) -> List[str]:
+    """Derive the list of target devices from CLI arguments."""
+
+    if torch.cuda.is_available():
+        return [f'cuda:{idx}' for idx in args.gpus]
+
+    if len(args.gpus) > 1:
+        print('[MAIN] CUDA not available; using CPU despite multiple GPU indices being provided.')
+
+    return ['cpu']
+
+
+def get_task_sequence(task: str) -> List[str]:
+    """Expand the CLI task argument into the ordered subtask sequence."""
+
+    return ['seg', 'coords', 'feat'] if task == 'all' else [task]
+
+
+def get_coords_dir(args: argparse.Namespace) -> str:
+    """Derive the coordinate directory name based on CLI arguments."""
+
+    return args.coords_dir or f'{args.mag}x_{args.patch_size}px_{args.overlap}px_overlap'
+
+
+def feature_exists(directory: str, slide_name: str) -> bool:
+    """Check if a feature file exists for the given slide in the directory."""
+
+    if not directory or not os.path.isdir(directory):
+        return False
+
+    return any(
+        os.path.exists(os.path.join(directory, f'{slide_name}.{ext}'))
+        for ext in ('h5', 'pt')
+    )
+
+
+def slide_outputs_complete(slide_path: str, args: argparse.Namespace, task_sequence: Sequence[str]) -> bool:
+    """Return True if all required outputs exist for the slide for the requested tasks."""
+
+    slide_stem = os.path.splitext(os.path.basename(slide_path))[0]
+    coords_dir = get_coords_dir(args)
+
+    for task_name in task_sequence:
+        if task_name == 'seg':
+            contour_path = os.path.join(args.job_dir, 'contours', f'{slide_stem}.jpg')
+            if not os.path.exists(contour_path):
+                return False
+        elif task_name == 'coords':
+            coords_path = os.path.join(args.job_dir, coords_dir, 'patches', f'{slide_stem}_patches.h5')
+            if not os.path.exists(coords_path):
+                return False
+        elif task_name == 'feat':
+            if args.slide_encoder is None:
+                features_dir = os.path.join(args.job_dir, coords_dir, f'features_{args.patch_encoder}')
+            else:
+                features_dir = os.path.join(args.job_dir, coords_dir, f'slide_features_{args.slide_encoder}')
+
+            if not feature_exists(features_dir, slide_stem):
+                return False
+        else:
+            return False
+
+    return True
+
+
+def filter_completed_slides(slide_paths: List[str], args: argparse.Namespace, task_sequence: Sequence[str]) -> List[str]:
+    """Filter out slides whose outputs already exist for all requested tasks."""
+
+    return [slide for slide in slide_paths if not slide_outputs_complete(slide, args, task_sequence)]
+
+
+def cleanup_lock_files(job_dir: str) -> int:
+    """Remove stale Trident lock files within the provided job directory."""
+
+    if not os.path.isdir(job_dir):
+        return 0
+
+    removed = 0
+    for root, _, files in os.walk(job_dir):
+        for filename in files:
+            if filename.endswith('.lock'):
+                lock_path = os.path.join(root, filename)
+                try:
+                    os.remove(lock_path)
+                    removed += 1
+                except OSError:
+                    pass
+
+    return removed
+
+
+def cleanup_cache_dir(cache_dir: Optional[str]) -> int:
+    """Remove all contents from the cache directory if it exists."""
+
+    if not cache_dir or not os.path.isdir(cache_dir):
+        return 0
+
+    removed = 0
+    for item in os.listdir(cache_dir):
+        item_path = os.path.join(cache_dir, item)
+        try:
+            if os.path.isdir(item_path):
+                shutil.rmtree(item_path)
+            else:
+                os.remove(item_path)
+            removed += 1
+        except OSError:
+            pass
+
+    return removed
+
+
+def load_custom_slide_rows(csv_path: str) -> Tuple[Dict[str, Dict[str, str]], List[str]]:
+    """Load rows from a user-provided slide CSV so batches keep metadata like MPP."""
+
+    with open(csv_path, newline='') as handle:
+        reader = csv.DictReader(handle)
+        if not reader.fieldnames or 'wsi' not in reader.fieldnames:
+            raise ValueError(f"Custom slide list '{csv_path}' must include a 'wsi' column.")
+        fieldnames = reader.fieldnames
+        rows = {row['wsi']: dict(row) for row in reader}
+
+    return rows, fieldnames
+
+
+def write_batch_csv(
+    rel_paths: Sequence[str],
+    batch_id: int,
+    root_dir: str,
+    rows_by_wsi: Optional[Dict[str, Dict[str, str]]],
+    fieldnames: Sequence[str],
+    source_csv: Optional[str] = None,
+) -> str:
+    """Persist a per-batch CSV listing slides for Processor consumption."""
+
+    os.makedirs(root_dir, exist_ok=True)
+    csv_path = os.path.join(root_dir, f'batch_{batch_id:05d}.csv')
+    with open(csv_path, 'w', newline='') as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for rel_path in rel_paths:
+            if rows_by_wsi is not None:
+                row = rows_by_wsi.get(rel_path)
+                if row is None:
+                    location = source_csv or 'the provided slide list'
+                    raise ValueError(f"Slide '{rel_path}' not found in {location}.")
+                writer.writerow(row)
+            else:
+                writer.writerow({'wsi': rel_path})
+
+    return csv_path
+
+
+def safe_remove(path: str) -> None:
+    """Silently delete a file if it exists."""
+
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def safe_rmtree(path: str) -> None:
+    """Silently delete a directory tree if it exists."""
+
+    shutil.rmtree(path, ignore_errors=True)
+
+
 def initialize_processor(args: argparse.Namespace) -> Processor:
     """
     Initialize the Trident Processor with arguments set in `run_batch_of_slides`.
@@ -203,7 +388,7 @@ def run_task(processor: Processor, args: argparse.Namespace) -> None:
             holes_are_tissue= not args.remove_holes,
             artifact_remover_model=artifact_remover_model,
             batch_size=args.seg_batch_size if args.seg_batch_size is not None else args.batch_size,
-            device=f'cuda:{args.gpu}',
+            device=args.device,
         )
     elif args.task == 'coords':
         processor.run_patching_job(
@@ -220,7 +405,7 @@ def run_task(processor: Processor, args: argparse.Namespace) -> None:
             processor.run_patch_feature_extraction_job(
                 coords_dir=args.coords_dir or f'{args.mag}x_{args.patch_size}px_{args.overlap}px_overlap',
                 patch_encoder=encoder,
-                device=f'cuda:{args.gpu}',
+                device=args.device,
                 saveas='h5',
                 batch_limit=args.feat_batch_size if args.feat_batch_size is not None else args.batch_size,
             )
@@ -230,7 +415,7 @@ def run_task(processor: Processor, args: argparse.Namespace) -> None:
             processor.run_slide_feature_extraction_job(
                 slide_encoder=encoder,
                 coords_dir=args.coords_dir or f'{args.mag}x_{args.patch_size}px_{args.overlap}px_overlap',
-                device=f'cuda:{args.gpu}',
+                device=args.device,
                 saveas='h5',
                 batch_limit=args.feat_batch_size if args.feat_batch_size is not None else args.batch_size,
             )
@@ -248,65 +433,131 @@ def main() -> None:
     """
 
     args = parse_arguments()
-    args.device = f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu'
+    os.makedirs(args.job_dir, exist_ok=True)
+    
+    # Cleanup stale lock files
+    cleaned_locks = cleanup_lock_files(args.job_dir)
+    if cleaned_locks:
+        print(f"[MAIN] Cleared {cleaned_locks} stale lock file(s) under {args.job_dir}.")
+    
+    # Cleanup cache directory if specified
+    if args.wsi_cache:
+        cleaned_cache = cleanup_cache_dir(args.wsi_cache)
+        if cleaned_cache:
+            print(f"[MAIN] Cleared {cleaned_cache} item(s) from cache directory {args.wsi_cache}.")
+    
+    devices = resolve_devices(args)
+    task_sequence = get_task_sequence(args.task)
+
+    list_workers = args.max_workers if args.max_workers and args.max_workers > 0 else 8
+    if args.max_workers == 0:
+        list_workers = 1
+    full_paths, rel_paths = collect_valid_slides(
+        wsi_dir=args.wsi_dir,
+        custom_list_path=args.custom_list_of_wsis,
+        wsi_ext=args.wsi_ext,
+        search_nested=args.search_nested,
+        max_workers=list_workers,
+        return_relative_paths=True,
+    )
+    print(f"[MAIN] Found {len(full_paths)} valid slides in {args.wsi_dir}.")
+
+    if not full_paths:
+        print('[MAIN] No slides found. Exiting.')
+        return
+
+    rel_map = {full_path: rel_path for full_path, rel_path in zip(full_paths, rel_paths)}
+    pending_paths = filter_completed_slides(full_paths, args, task_sequence)
+    skipped = len(full_paths) - len(pending_paths)
+    if skipped:
+        print(f"[MAIN] Skipping {skipped} slide(s) with completed outputs.")
+
+    if not pending_paths:
+        print('[MAIN] All requested work already complete. Nothing to process.')
+        return
+
+    pending_infos = [(path, rel_map[path]) for path in pending_paths]
+    batch_size = args.cache_batch_size if args.cache_batch_size and args.cache_batch_size > 0 else len(pending_infos)
+    batch_size = max(1, batch_size)
 
     if args.wsi_cache:
-        # === Parallel pipeline with caching ===
+        os.makedirs(args.wsi_cache, exist_ok=True)
+        print(f"[MAIN] Using cache directory {args.wsi_cache}.")
+    csv_root = os.path.join(args.job_dir, '_trident_batches') if not args.wsi_cache else None
 
-        from queue import Queue
-        from threading import Thread
-
-        from trident.Concurrency import batch_producer, batch_consumer, cache_batch
-        from trident.IO import collect_valid_slides
-
-        queue = Queue(maxsize=1)
-        valid_slides = collect_valid_slides(
-            wsi_dir=args.wsi_dir,
-            custom_list_path=args.custom_list_of_wsis,
-            wsi_ext=args.wsi_ext,
-            search_nested=args.search_nested,
-            max_workers=args.max_workers
-        )
-        print(f"[MAIN] Found {len(valid_slides)} valid slides in {args.wsi_dir}.")
-
-        warm = valid_slides[:args.cache_batch_size]
-        warmup_dir = os.path.join(args.wsi_cache, "batch_0")
-        print(f"[MAIN] Warmup caching batch: {warmup_dir}")
-        cache_batch(warm, warmup_dir)
-        queue.put(0)
-
-        def processor_factory(wsi_dir: str) -> Processor:
-            local_args = argparse.Namespace(**vars(args))
-            local_args.wsi_dir = wsi_dir
-            local_args.wsi_cache = None
-            local_args.custom_list_of_wsis = None
-            local_args.search_nested = False
-            return initialize_processor(local_args)
-
-        def run_task_fn(processor: Processor, task_name: str) -> None:
-            args.task = task_name
-            run_task(processor, args)
-
-        producer = Thread(target=batch_producer, args=(
-            queue, valid_slides, args.cache_batch_size, args.cache_batch_size, args.wsi_cache
-        ))
-
-        consumer = Thread(target=batch_consumer, args=(
-            queue, args.task, args.wsi_cache, processor_factory, run_task_fn
-        ))
-
-        print("[MAIN] Starting producer and consumer threads.")
-        producer.start()
-        consumer.start()
-        producer.join()
-        consumer.join()
+    if args.custom_list_of_wsis:
+        custom_rows, custom_columns = load_custom_slide_rows(args.custom_list_of_wsis)
     else:
-        # === Sequential mode ===
-        processor = initialize_processor(args)
-        tasks = ['seg', 'coords', 'feat'] if args.task == 'all' else [args.task]
-        for task_name in tasks:
-            args.task = task_name
-            run_task(processor, args)
+        custom_rows, custom_columns = None, ['wsi']
+
+    queue: "Queue[Optional[Tuple[int, List[Tuple[str, str]]]]]" = Queue(maxsize=max(1, len(devices) * 2))
+
+    def worker(device: str) -> None:
+        while True:
+            item = queue.get()
+            if item is None:
+                queue.task_done()
+                break
+
+            batch_id, batch_infos = item
+            full_batch = [entry[0] for entry in batch_infos]
+            rel_batch = [entry[1] for entry in batch_infos]
+
+            cleanup_fn = lambda: None
+            processor: Optional[Processor] = None
+
+            try:
+                if args.wsi_cache:
+                    dest_dir = os.path.join(args.wsi_cache, f'batch_{batch_id}')
+                    print(f"[WORKER {device}] Caching batch {batch_id} to {dest_dir}.")
+                    cache_batch(full_batch, dest_dir)
+                    local_args = clone_args(
+                        args,
+                        wsi_dir=dest_dir,
+                        wsi_cache=None,
+                        custom_list_of_wsis=None,
+                        search_nested=False,
+                    )
+                    cleanup_fn = lambda d=dest_dir: safe_rmtree(d)
+                else:
+                    csv_path = write_batch_csv(
+                        rel_batch,
+                        batch_id,
+                        csv_root,
+                        custom_rows,
+                        custom_columns,
+                        args.custom_list_of_wsis,
+                    )
+                    local_args = clone_args(args, custom_list_of_wsis=csv_path)
+                    cleanup_fn = lambda p=csv_path: safe_remove(p)
+
+                processor = initialize_processor(local_args)
+                for task_name in task_sequence:
+                    run_task(processor, clone_args(args, task=task_name, device=device))
+            finally:
+                if processor is not None and hasattr(processor, 'release'):
+                    processor.release()
+                cleanup_fn()
+                queue.task_done()
+
+    workers = [Thread(target=worker, args=(device,), daemon=True) for device in devices]
+    for thread in workers:
+        thread.start()
+
+    for batch_id, start_idx in enumerate(range(0, len(pending_infos), batch_size)):
+        queue.put((batch_id, pending_infos[start_idx:start_idx + batch_size]))
+
+    print(f"[MAIN] Dispatching {len(pending_infos)} slide(s) across devices: {', '.join(devices)}.")
+
+    for _ in devices:
+        queue.put(None)
+
+    queue.join()
+    for thread in workers:
+        thread.join()
+
+    if csv_root and os.path.isdir(csv_root):
+        safe_rmtree(csv_root)
 
 
 if __name__ == "__main__":
