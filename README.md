@@ -54,12 +54,12 @@ python run_single_slide.py --slide_path ./wsis/xxxx.svs --job_dir ./trident_proc
 **Step 1: Tissue Segmentation:** Segments tissue vs. background from a dir of WSIs
  - **Command**:
    ```bash
-   python run_batch_of_slides.py --task seg --wsi_dir ./wsis --job_dir ./trident_processed --gpu 0 --segmenter hest
+  python run_batch_of_slides.py --task seg --wsi_dir ./wsis --job_dir ./trident_processed --gpus 0 --segmenter hest
    ```
    - `--task seg`: Specifies that you want to do tissue segmentation.
    - `--wsi_dir ./wsis`: Path to dir with your WSIs.
    - `--job_dir ./trident_processed`: Output dir for processed results.
-   - `--gpu 0`: Uses GPU with index 0.
+  - `--gpus 0`: Uses GPU with index 0. Provide multiple indices (e.g., `--gpus 0 1`) to process batches in parallel across devices when using the cache pipeline.
    - `--segmenter`: Segmentation model. Defaults to `hest`. Switch to `grandqc` for fast H&E segmentation. Add the option `--remove_artifacts` for additional artifact clean up.
  - **Outputs**:
    - WSI thumbnails in `./trident_processed/thumbnails`.
