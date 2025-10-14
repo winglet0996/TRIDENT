@@ -68,7 +68,7 @@ Trident supports flexible multiprocessing, so you can run many instances of cach
 Here is an example workflow using multiprocessing:
 1. Open a terminal window (it is highly recommended you use [tmux](https://github.com/tmux/tmux/wiki) so that processes continue running even if your computer sleeps) and start a segmentation job:
 ```bash
-python run_batch_of_slides.py --task seg --wsi_dir ./wsis --job_dir ./trident_processed --gpu 0
+python run_batch_of_slides.py --task seg --wsi_dir ./wsis --job_dir ./trident_processed --gpus 0
 ```
 2. Open another terminal window (or another tmux pane) and run the exact same command.
 3. Repeat Step 2 one or more times to spawn additional processes depending on how powerful your computer is. Be careful not to overload your machine, see Tips below:
