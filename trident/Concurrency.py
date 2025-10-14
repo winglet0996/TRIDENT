@@ -37,6 +37,10 @@ def cache_batch(wsis: List[str], dest_dir: str) -> List[str]:
                 dest_mrxs_dir = os.path.join(dest_dir, os.path.basename(mrxs_dir))
                 shutil.copytree(mrxs_dir, dest_mrxs_dir)
 
+    # Create completion marker
+    with open(os.path.join(dest_dir, '.cache_complete'), 'w') as f:
+        f.write('done')
+
     return copied
 
 
