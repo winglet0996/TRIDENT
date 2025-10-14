@@ -410,68 +410,67 @@ def main() -> None:
     else:
         custom_rows, custom_columns = None, ['wsi']
 
-    queue: "Queue[Optional[Tuple[int, List[Tuple[str, str]]]]]" = Queue(maxsize=max(1, len(devices) * 2))
+    queue: "Queue[Optional[Tuple[int, str]]]" = Queue(maxsize=2)  # Pre-cache 2 batches
+
+    def cacher() -> None:
+        """Pre-caches batches and puts ready paths in queue."""
+        for batch_id, start_idx in enumerate(range(0, len(pending_infos), batch_size)):
+            batch_infos = pending_infos[start_idx:start_idx + batch_size]
+            
+            if args.wsi_cache:
+                full_batch = [info[0] for info in batch_infos]
+                dest_dir = os.path.join(args.wsi_cache, f'batch_{batch_id}')
+                print(f"[CACHE] Caching batch {batch_id} to {dest_dir}.")
+                cache_batch(full_batch, dest_dir)
+                queue.put((batch_id, dest_dir))
+            else:
+                rel_batch = [info[1] for info in batch_infos]
+                csv_path = write_batch_csv(rel_batch, batch_id, csv_root, 
+                                          custom_rows, custom_columns, args.custom_list_of_wsis)
+                queue.put((batch_id, csv_path))
+        
+        for _ in devices:
+            queue.put(None)
 
     def worker(device: str) -> None:
+        """Processes pre-cached batches."""
         while True:
             item = queue.get()
             if item is None:
                 queue.task_done()
                 break
 
-            batch_id, batch_infos = item
-            full_batch = [entry[0] for entry in batch_infos]
-            rel_batch = [entry[1] for entry in batch_infos]
-
-            cleanup_fn = lambda: None
-            processor: Optional[Processor] = None
-
+            batch_id, location = item
+            processor = None
             try:
                 if args.wsi_cache:
-                    dest_dir = os.path.join(args.wsi_cache, f'batch_{batch_id}')
-                    print(f"[WORKER {device}] Caching batch {batch_id} to {dest_dir}.")
-                    cache_batch(full_batch, dest_dir)
-                    local_args = clone_args(
-                        args,
-                        wsi_dir=dest_dir,
-                        wsi_cache=None,
-                        custom_list_of_wsis=None,
-                        search_nested=False,
-                    )
-                    cleanup_fn = lambda d=dest_dir: shutil.rmtree(d, ignore_errors=True)
+                    print(f"[WORKER {device}] Processing batch {batch_id}.")
+                    local_args = clone_args(args, wsi_dir=location, wsi_cache=None, 
+                                           custom_list_of_wsis=None, search_nested=False)
                 else:
-                    csv_path = write_batch_csv(
-                        rel_batch,
-                        batch_id,
-                        csv_root,
-                        custom_rows,
-                        custom_columns,
-                        args.custom_list_of_wsis,
-                    )
-                    local_args = clone_args(args, custom_list_of_wsis=csv_path)
-                    cleanup_fn = lambda p=csv_path: (os.remove(p) if os.path.exists(p) else None)
+                    local_args = clone_args(args, custom_list_of_wsis=location)
 
                 processor = initialize_processor(local_args)
                 for task_name in task_sequence:
                     run_task(processor, clone_args(args, task=task_name, device=device))
             finally:
-                if processor is not None and hasattr(processor, 'release'):
+                if processor and hasattr(processor, 'release'):
                     processor.release()
-                cleanup_fn()
+                if args.wsi_cache:
+                    shutil.rmtree(location, ignore_errors=True)
+                elif location and os.path.exists(location):
+                    os.remove(location)
                 queue.task_done()
 
+    # Start cacher thread
+    Thread(target=cacher, daemon=True).start()
+
+    # Start worker threads
     workers = [Thread(target=worker, args=(device,), daemon=True) for device in devices]
     for thread in workers:
         thread.start()
 
-    for batch_id, start_idx in enumerate(range(0, len(pending_infos), batch_size)):
-        queue.put((batch_id, pending_infos[start_idx:start_idx + batch_size]))
-
-    print(f"[MAIN] Dispatching {len(pending_infos)} slide(s) across devices: {', '.join(devices)}.")
-
-    for _ in devices:
-        queue.put(None)
-
+    print(f"[MAIN] Dispatching {len(pending_infos)} slide(s) across {len(devices)} device(s).")
     queue.join()
     for thread in workers:
         thread.join()
