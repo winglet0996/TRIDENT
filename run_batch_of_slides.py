@@ -397,13 +397,16 @@ def main() -> None:
         return
 
     pending_infos = [(path, rel_map[path]) for path in pending_paths]
-    batch_size = args.cache_batch_size if args.cache_batch_size and args.cache_batch_size > 0 else len(pending_infos)
-    batch_size = max(1, batch_size)
-
+    
+    # Determine batch size: cache mode uses cache_batch_size, non-cache mode splits evenly across GPUs
     if args.wsi_cache:
+        batch_size = max(1, args.cache_batch_size or 32)
         os.makedirs(args.wsi_cache, exist_ok=True)
         print(f"[MAIN] Using cache directory {args.wsi_cache}.")
-    csv_root = os.path.join(args.job_dir, '_trident_batches') if not args.wsi_cache else None
+    else:
+        batch_size = max(1, (len(pending_infos) + len(devices) - 1) // len(devices))
+    
+    csv_root = None if args.wsi_cache else os.path.join(args.job_dir, '_trident_batches')
 
     if args.custom_list_of_wsis:
         custom_rows, custom_columns = load_custom_slide_rows(args.custom_list_of_wsis)
@@ -443,8 +446,17 @@ def main() -> None:
             batch_id, location = item
             processor = None
             try:
+                # Wait for cache completion if using cache mode
                 if args.wsi_cache:
-                    print(f"[WORKER {device}] Processing batch {batch_id}.")
+                    import time
+                    marker = os.path.join(location, '.cache_complete')
+                    while not os.path.exists(marker):
+                        time.sleep(0.5)
+                
+                print(f"[WORKER {device}] Processing batch {batch_id}.")
+                
+                # Configure args based on cache mode
+                if args.wsi_cache:
                     local_args = clone_args(args, wsi_dir=location, wsi_cache=None, 
                                            custom_list_of_wsis=None, search_nested=False)
                 else:
@@ -452,7 +464,7 @@ def main() -> None:
 
                 processor = initialize_processor(local_args)
                 for task_name in task_sequence:
-                    run_task(processor, clone_args(args, task=task_name, device=device))
+                    run_task(processor, clone_args(local_args, task=task_name, device=device))
             finally:
                 if processor and hasattr(processor, 'release'):
                     processor.release()
