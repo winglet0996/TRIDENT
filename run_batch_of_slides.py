@@ -123,35 +123,8 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def parse_arguments() -> argparse.Namespace:
-    """
-    Parse command-line arguments and return the parsed namespace.
-
-    Returns
-    -------
-    argparse.Namespace
-        Parsed command-line arguments.
-    """
-    return build_parser().parse_args()
-
-
-def generate_help_text() -> str:
-    """
-    Generate the command-line help text for documentation purposes.
-    
-    Returns
-    -------
-    str
-        The full help message string from the argument parser.
-    """
-    parser = build_parser()
-    return parser.format_help()
-
-
 def clone_args(base_args: argparse.Namespace, **overrides: Any) -> argparse.Namespace:
-    """
-    Return a shallow copy of the provided namespace with updates applied."""
-
+    """Return a shallow copy of the provided namespace with updates applied."""
     data = vars(base_args).copy()
     data.update(overrides)
     return argparse.Namespace(**data)
@@ -159,114 +132,82 @@ def clone_args(base_args: argparse.Namespace, **overrides: Any) -> argparse.Name
 
 def resolve_devices(args: argparse.Namespace) -> List[str]:
     """Derive the list of target devices from CLI arguments."""
-
     if torch.cuda.is_available():
         return [f'cuda:{idx}' for idx in args.gpus]
-
     if len(args.gpus) > 1:
         print('[MAIN] CUDA not available; using CPU despite multiple GPU indices being provided.')
-
     return ['cpu']
-
-
-def get_task_sequence(task: str) -> List[str]:
-    """Expand the CLI task argument into the ordered subtask sequence."""
-
-    return ['seg', 'coords', 'feat'] if task == 'all' else [task]
-
-
-def get_coords_dir(args: argparse.Namespace) -> str:
-    """Derive the coordinate directory name based on CLI arguments."""
-
-    return args.coords_dir or f'{args.mag}x_{args.patch_size}px_{args.overlap}px_overlap'
-
-
-def feature_exists(directory: str, slide_name: str) -> bool:
-    """Check if a feature file exists for the given slide in the directory."""
-
-    if not directory or not os.path.isdir(directory):
-        return False
-
-    return any(
-        os.path.exists(os.path.join(directory, f'{slide_name}.{ext}'))
-        for ext in ('h5', 'pt')
-    )
 
 
 def slide_outputs_complete(slide_path: str, args: argparse.Namespace, task_sequence: Sequence[str]) -> bool:
     """Return True if all required outputs exist for the slide for the requested tasks."""
-
     slide_stem = os.path.splitext(os.path.basename(slide_path))[0]
-    coords_dir = get_coords_dir(args)
+    coords_dir = args.coords_dir or f'{args.mag}x_{args.patch_size}px_{args.overlap}px_overlap'
 
     for task_name in task_sequence:
         if task_name == 'seg':
-            contour_path = os.path.join(args.job_dir, 'contours', f'{slide_stem}.jpg')
-            if not os.path.exists(contour_path):
+            if not os.path.exists(os.path.join(args.job_dir, 'contours', f'{slide_stem}.jpg')):
                 return False
         elif task_name == 'coords':
-            coords_path = os.path.join(args.job_dir, coords_dir, 'patches', f'{slide_stem}_patches.h5')
-            if not os.path.exists(coords_path):
+            if not os.path.exists(os.path.join(args.job_dir, coords_dir, 'patches', f'{slide_stem}_patches.h5')):
                 return False
         elif task_name == 'feat':
+            # Check if feature file exists
             if args.slide_encoder is None:
                 features_dir = os.path.join(args.job_dir, coords_dir, f'features_{args.patch_encoder}')
             else:
                 features_dir = os.path.join(args.job_dir, coords_dir, f'slide_features_{args.slide_encoder}')
-
-            if not feature_exists(features_dir, slide_stem):
+            
+            if not features_dir or not os.path.isdir(features_dir):
+                return False
+            if not any(os.path.exists(os.path.join(features_dir, f'{slide_stem}.{ext}')) for ext in ('h5', 'pt')):
                 return False
         else:
             return False
-
     return True
 
 
 def filter_completed_slides(slide_paths: List[str], args: argparse.Namespace, task_sequence: Sequence[str]) -> List[str]:
     """Filter out slides whose outputs already exist for all requested tasks."""
-
     return [slide for slide in slide_paths if not slide_outputs_complete(slide, args, task_sequence)]
 
 
-def cleanup_lock_files(job_dir: str) -> int:
-    """Remove stale Trident lock files within the provided job directory."""
-
-    if not os.path.isdir(job_dir):
-        return 0
-
-    removed = 0
-    for root, _, files in os.walk(job_dir):
-        for filename in files:
-            if filename.endswith('.lock'):
-                lock_path = os.path.join(root, filename)
-                try:
-                    os.remove(lock_path)
-                    removed += 1
-                except OSError:
-                    pass
-
-    return removed
-
-
-def cleanup_cache_dir(cache_dir: Optional[str]) -> int:
-    """Remove all contents from the cache directory if it exists."""
-
-    if not cache_dir or not os.path.isdir(cache_dir):
-        return 0
-
-    removed = 0
-    for item in os.listdir(cache_dir):
-        item_path = os.path.join(cache_dir, item)
-        try:
-            if os.path.isdir(item_path):
-                shutil.rmtree(item_path)
-            else:
-                os.remove(item_path)
-            removed += 1
-        except OSError:
-            pass
-
-    return removed
+def cleanup_files(job_dir: str, cache_dir: Optional[str] = None) -> Tuple[int, int]:
+    """
+    Remove stale lock files and optionally clean cache directory.
+    
+    Returns
+    -------
+    Tuple[int, int]
+        Number of lock files removed and cache items removed.
+    """
+    # Remove lock files
+    lock_count = 0
+    if os.path.isdir(job_dir):
+        for root, _, files in os.walk(job_dir):
+            for filename in files:
+                if filename.endswith('.lock'):
+                    try:
+                        os.remove(os.path.join(root, filename))
+                        lock_count += 1
+                    except OSError:
+                        pass
+    
+    # Clean cache directory
+    cache_count = 0
+    if cache_dir and os.path.isdir(cache_dir):
+        for item in os.listdir(cache_dir):
+            item_path = os.path.join(cache_dir, item)
+            try:
+                if os.path.isdir(item_path):
+                    shutil.rmtree(item_path)
+                else:
+                    os.remove(item_path)
+                cache_count += 1
+            except OSError:
+                pass
+    
+    return lock_count, cache_count
 
 
 def load_custom_slide_rows(csv_path: str) -> Tuple[Dict[str, Dict[str, str]], List[str]]:
@@ -291,7 +232,6 @@ def write_batch_csv(
     source_csv: Optional[str] = None,
 ) -> str:
     """Persist a per-batch CSV listing slides for Processor consumption."""
-
     os.makedirs(root_dir, exist_ok=True)
     csv_path = os.path.join(root_dir, f'batch_{batch_id:05d}.csv')
     with open(csv_path, 'w', newline='') as handle:
@@ -306,23 +246,7 @@ def write_batch_csv(
                 writer.writerow(row)
             else:
                 writer.writerow({'wsi': rel_path})
-
     return csv_path
-
-
-def safe_remove(path: str) -> None:
-    """Silently delete a file if it exists."""
-
-    try:
-        os.remove(path)
-    except OSError:
-        pass
-
-
-def safe_rmtree(path: str) -> None:
-    """Silently delete a directory tree if it exists."""
-
-    shutil.rmtree(path, ignore_errors=True)
 
 
 def initialize_processor(args: argparse.Namespace) -> Processor:
@@ -431,23 +355,19 @@ def main() -> None:
     WSI caching is enabled. Supports segmentation, coordinate extraction,
     and feature extraction tasks.
     """
-
-    args = parse_arguments()
+    # Parse arguments
+    args = build_parser().parse_args()
     os.makedirs(args.job_dir, exist_ok=True)
     
-    # Cleanup stale lock files
-    cleaned_locks = cleanup_lock_files(args.job_dir)
-    if cleaned_locks:
-        print(f"[MAIN] Cleared {cleaned_locks} stale lock file(s) under {args.job_dir}.")
-    
-    # Cleanup cache directory if specified
-    if args.wsi_cache:
-        cleaned_cache = cleanup_cache_dir(args.wsi_cache)
-        if cleaned_cache:
-            print(f"[MAIN] Cleared {cleaned_cache} item(s) from cache directory {args.wsi_cache}.")
+    # Cleanup stale lock files and cache directory
+    lock_count, cache_count = cleanup_files(args.job_dir, args.wsi_cache)
+    if lock_count:
+        print(f"[MAIN] Cleared {lock_count} stale lock file(s) under {args.job_dir}.")
+    if cache_count:
+        print(f"[MAIN] Cleared {cache_count} item(s) from cache directory {args.wsi_cache}.")
     
     devices = resolve_devices(args)
-    task_sequence = get_task_sequence(args.task)
+    task_sequence = ['seg', 'coords', 'feat'] if args.task == 'all' else [args.task]
 
     list_workers = args.max_workers if args.max_workers and args.max_workers > 0 else 8
     if args.max_workers == 0:
@@ -518,7 +438,7 @@ def main() -> None:
                         custom_list_of_wsis=None,
                         search_nested=False,
                     )
-                    cleanup_fn = lambda d=dest_dir: safe_rmtree(d)
+                    cleanup_fn = lambda d=dest_dir: shutil.rmtree(d, ignore_errors=True)
                 else:
                     csv_path = write_batch_csv(
                         rel_batch,
@@ -529,7 +449,7 @@ def main() -> None:
                         args.custom_list_of_wsis,
                     )
                     local_args = clone_args(args, custom_list_of_wsis=csv_path)
-                    cleanup_fn = lambda p=csv_path: safe_remove(p)
+                    cleanup_fn = lambda p=csv_path: (os.remove(p) if os.path.exists(p) else None)
 
                 processor = initialize_processor(local_args)
                 for task_name in task_sequence:
@@ -556,8 +476,9 @@ def main() -> None:
     for thread in workers:
         thread.join()
 
+    # Cleanup temporary batch CSV directory
     if csv_root and os.path.isdir(csv_root):
-        safe_rmtree(csv_root)
+        shutil.rmtree(csv_root, ignore_errors=True)
 
 
 if __name__ == "__main__":
