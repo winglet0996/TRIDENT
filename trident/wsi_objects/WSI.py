@@ -762,7 +762,8 @@ class WSI:
         device: str = 'cuda:0',
         saveas: str = 'h5',
         batch_limit: int = 512,
-        verbose: bool = False
+        verbose: bool = False,
+        num_workers: Optional[int] = None,
     ) -> str:
         """
         Extract feature embeddings from the WSI using a specified patch encoder.
@@ -783,6 +784,8 @@ class WSI:
             Maximum batch size for feature extraction. Defaults to 512.
         verbose : bool, optional
             Whether to print patch embedding progress. Defaults to False.
+        num_workers : Optional[int], optional
+            Number of workers to use for the tile dataloader, if set to None the number of workers is automatically inferred. Defaults to None.
 
         Returns
         -------
