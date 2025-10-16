@@ -1,4 +1,5 @@
 from __future__ import annotations
+import multiprocessing as mp
 import numpy as np
 import os 
 import warnings
@@ -313,11 +314,18 @@ class WSI:
         precision = segmentation_model.precision
         eval_transforms = segmentation_model.eval_transforms
         dataset = WSIPatcherDataset(patcher, eval_transforms)
+
+        if num_workers is None:
+            inferred_workers = get_num_workers(batch_size, max_workers=self.max_workers)
+            if mp.parent_process() is not None and inferred_workers > 0:
+                inferred_workers = 0  # spawned worker cannot pickle WSI handles
+            num_workers = inferred_workers
+
         dataloader = DataLoader(
-            dataset, 
-            batch_size=batch_size, 
+            dataset,
+            batch_size=batch_size,
             collate_fn=collate_fn,
-            num_workers=get_num_workers(batch_size, max_workers=self.max_workers) if num_workers is None else num_workers, 
+            num_workers=num_workers,
             pin_memory=True
         )
 
@@ -818,7 +826,14 @@ class WSI:
 
 
         dataset = WSIPatcherDataset(patcher, patch_transforms)
-        dataloader = DataLoader(dataset, batch_size=batch_limit, num_workers=get_num_workers(batch_limit, max_workers=self.max_workers), pin_memory=False)
+
+        if num_workers is None:
+            inferred_workers = get_num_workers(batch_limit, max_workers=self.max_workers)
+            if mp.parent_process() is not None and inferred_workers > 0:
+                inferred_workers = 0  # spawned worker cannot pickle WSI handles
+            num_workers = inferred_workers
+        
+        dataloader = DataLoader(dataset, batch_size=batch_limit, num_workers=num_workers, pin_memory=False)
 
         dataloader = tqdm(dataloader) if verbose else dataloader
 
