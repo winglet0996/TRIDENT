@@ -8,9 +8,10 @@ python run_batch_of_slides.py --task all --wsi_dir output/wsis --job_dir output 
 """
 import argparse
 import csv
+import multiprocessing as mp
 import os
 import shutil
-from queue import Queue
+import time
 from threading import Thread
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -292,16 +293,17 @@ def run_task(processor: Processor, args: argparse.Namespace) -> None:
     if args.task == 'seg':
         from trident.segmentation_models.load import segmentation_model_factory
 
-        # instantiate segmentation model and artifact remover if requested by user
+        # instantiate segmentation model and artifact remover in worker process to avoid pickle issues
         segmentation_model = segmentation_model_factory(
             args.segmenter,
             confidence_thresh=args.seg_conf_thresh,
-        )
+        ).to(args.device)
+        
         if args.remove_artifacts or args.remove_penmarks:
             artifact_remover_model = segmentation_model_factory(
                 'grandqc_artifact',
                 remove_penmarks_only=args.remove_penmarks and not args.remove_artifacts
-            )
+            ).to(args.device)
         else:
             artifact_remover_model = None
 
@@ -325,7 +327,7 @@ def run_task(processor: Processor, args: argparse.Namespace) -> None:
     elif args.task == 'feat':
         if args.slide_encoder is None: 
             from trident.patch_encoder_models.load import encoder_factory
-            encoder = encoder_factory(args.patch_encoder, weights_path=args.patch_encoder_ckpt_path)
+            encoder = encoder_factory(args.patch_encoder, weights_path=args.patch_encoder_ckpt_path).to(args.device)
             processor.run_patch_feature_extraction_job(
                 coords_dir=args.coords_dir or f'{args.mag}x_{args.patch_size}px_{args.overlap}px_overlap',
                 patch_encoder=encoder,
@@ -335,7 +337,7 @@ def run_task(processor: Processor, args: argparse.Namespace) -> None:
             )
         else:
             from trident.slide_encoder_models.load import encoder_factory
-            encoder = encoder_factory(args.slide_encoder)
+            encoder = encoder_factory(args.slide_encoder).to(args.device)
             processor.run_slide_feature_extraction_job(
                 slide_encoder=encoder,
                 coords_dir=args.coords_dir or f'{args.mag}x_{args.patch_size}px_{args.overlap}px_overlap',
@@ -345,6 +347,63 @@ def run_task(processor: Processor, args: argparse.Namespace) -> None:
             )
     else:
         raise ValueError(f'Invalid task: {args.task}')
+
+
+def worker_process(
+    device: str,
+    queue: "mp.queues.JoinableQueue[Optional[Tuple[int, str]]]",
+    base_args: argparse.Namespace,
+    task_sequence: Sequence[str],
+) -> None:
+    """Consume batches from the queue and execute tasks on a dedicated GPU."""
+
+    threads = getattr(base_args, 'cpu_threads_per_worker', None)
+    if threads is not None:
+        try:
+            torch.set_num_threads(threads)
+        except (RuntimeError, AttributeError):
+            pass
+        try:
+            torch.set_num_interop_threads(max(1, threads // 2) if threads > 1 else 1)
+        except (RuntimeError, AttributeError):
+            pass
+        os.environ.setdefault('OMP_NUM_THREADS', str(threads))
+
+    if device.startswith('cuda') and torch.cuda.is_available():
+        torch.cuda.set_device(device)
+
+    while True:
+        item = queue.get()
+        if item is None:
+            queue.task_done()
+            break
+
+        batch_id, location = item
+        processor = None
+
+        try:
+            if base_args.wsi_cache:
+                marker = os.path.join(location, '.cache_complete')
+                while not os.path.exists(marker):
+                    time.sleep(0.5)
+                local_args = clone_args(base_args, wsi_dir=location, wsi_cache=None,
+                                        custom_list_of_wsis=None, search_nested=False)
+            else:
+                local_args = clone_args(base_args, custom_list_of_wsis=location)
+
+            print(f"[WORKER {device}] Processing batch {batch_id}.")
+            processor = initialize_processor(local_args)
+
+            for task_name in task_sequence:
+                run_task(processor, clone_args(local_args, task=task_name, device=device))
+        finally:
+            if processor and hasattr(processor, 'release'):
+                processor.release()
+            if base_args.wsi_cache:
+                shutil.rmtree(location, ignore_errors=True)
+            elif location and os.path.exists(location):
+                os.remove(location)
+            queue.task_done()
 
 
 def main() -> None:
@@ -413,7 +472,8 @@ def main() -> None:
     else:
         custom_rows, custom_columns = None, ['wsi']
 
-    queue: "Queue[Optional[Tuple[int, str]]]" = Queue(maxsize=2)  # Pre-cache 2 batches
+    ctx = mp.get_context("spawn")
+    queue = ctx.JoinableQueue(maxsize=2)  # Pre-cache 2 batches
 
     def cacher() -> None:
         """Pre-caches batches and puts ready paths in queue."""
@@ -435,57 +495,18 @@ def main() -> None:
         for _ in devices:
             queue.put(None)
 
-    def worker(device: str) -> None:
-        """Processes pre-cached batches."""
-        while True:
-            item = queue.get()
-            if item is None:
-                queue.task_done()
-                break
-
-            batch_id, location = item
-            processor = None
-            try:
-                # Wait for cache completion if using cache mode
-                if args.wsi_cache:
-                    import time
-                    marker = os.path.join(location, '.cache_complete')
-                    while not os.path.exists(marker):
-                        time.sleep(0.5)
-                
-                print(f"[WORKER {device}] Processing batch {batch_id}.")
-                
-                # Configure args based on cache mode
-                if args.wsi_cache:
-                    local_args = clone_args(args, wsi_dir=location, wsi_cache=None, 
-                                           custom_list_of_wsis=None, search_nested=False)
-                else:
-                    local_args = clone_args(args, custom_list_of_wsis=location)
-
-                processor = initialize_processor(local_args)
-                for task_name in task_sequence:
-                    run_task(processor, clone_args(local_args, task=task_name, device=device))
-            finally:
-                if processor and hasattr(processor, 'release'):
-                    processor.release()
-                if args.wsi_cache:
-                    shutil.rmtree(location, ignore_errors=True)
-                elif location and os.path.exists(location):
-                    os.remove(location)
-                queue.task_done()
-
     # Start cacher thread
     Thread(target=cacher, daemon=True).start()
 
-    # Start worker threads
-    workers = [Thread(target=worker, args=(device,), daemon=True) for device in devices]
-    for thread in workers:
-        thread.start()
+    workers = [ctx.Process(target=worker_process, args=(device, queue, args, task_sequence))
+               for device in devices]
+    for process in workers:
+        process.start()
 
     print(f"[MAIN] Dispatching {len(pending_infos)} slide(s) across {len(devices)} device(s).")
     queue.join()
-    for thread in workers:
-        thread.join()
+    for process in workers:
+        process.join()
 
     # Cleanup temporary batch CSV directory
     if csv_root and os.path.isdir(csv_root):
