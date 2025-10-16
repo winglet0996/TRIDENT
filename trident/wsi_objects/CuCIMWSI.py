@@ -298,6 +298,7 @@ class CuCIMWSI(WSI):
         return out
 
     def extract_patch_features(self, **kwargs) -> str:
+        kwargs['num_workers'] = 0  # CuImage objects cannot be pickled
         out = super().extract_patch_features(**kwargs)
         self.close()
         return out
