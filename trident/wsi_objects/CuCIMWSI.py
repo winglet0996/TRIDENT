@@ -282,6 +282,7 @@ class CuCIMWSI(WSI):
         return self.dimensions
 
     def segment_tissue(self, **kwargs) -> str:
+        kwargs['num_workers'] = 0  # CuImage objects cannot be pickled
         out = super().segment_tissue(**kwargs)
         self.close()
         return out
