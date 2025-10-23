@@ -318,6 +318,7 @@ def main() -> None:
     WSI caching is enabled. Supports segmentation, coordinate extraction,
     and feature extraction tasks.
     """
+    from trident.IO import collect_valid_slides
 
     args = parse_arguments()
     args.device = f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu'
@@ -329,43 +330,34 @@ def main() -> None:
     if cache_count:
         print(f"[MAIN] Cleared {cache_count} item(s) from cache directory {args.wsi_cache}.")
 
+    # Collect and filter slides once
+    all_slides = collect_valid_slides(
+        wsi_dir=args.wsi_dir,
+        custom_list_path=args.custom_list_of_wsis,
+        wsi_ext=args.wsi_ext,
+        search_nested=args.search_nested,
+        max_workers=args.max_workers
+    )
+    print(f"[MAIN] Found {len(all_slides)} valid slides in {args.wsi_dir}.")
+    
+    task_sequence = ['seg', 'coords', 'feat'] if args.task == 'all' else [args.task]
+    pending_slides = filter_completed_slides(all_slides, args, task_sequence)
+    
+    if (skipped := len(all_slides) - len(pending_slides)):
+        print(f"[MAIN] Skipping {skipped} slide(s) with completed outputs.")
+    
+    if not pending_slides:
+        print('[MAIN] All requested work already complete. Nothing to process.')
+        return
+
     if args.wsi_cache:
         # === Parallel pipeline with caching ===
-
         from queue import Queue
         from threading import Thread
-
         from trident.Concurrency import batch_producer, batch_consumer, cache_batch
-        from trident.IO import collect_valid_slides
 
         queue = Queue(maxsize=1)
-        valid_slides = collect_valid_slides(
-            wsi_dir=args.wsi_dir,
-            custom_list_path=args.custom_list_of_wsis,
-            wsi_ext=args.wsi_ext,
-            search_nested=args.search_nested,
-            max_workers=args.max_workers
-        )
-        print(f"[MAIN] Found {len(valid_slides)} valid slides in {args.wsi_dir}.")
-        
-        # Filter out completed slides
-        task_sequence = ['seg', 'coords', 'feat'] if args.task == 'all' else [args.task]
-        valid_slides = filter_completed_slides(valid_slides, args, task_sequence)
-        skipped = len(collect_valid_slides(
-            wsi_dir=args.wsi_dir,
-            custom_list_path=args.custom_list_of_wsis,
-            wsi_ext=args.wsi_ext,
-            search_nested=args.search_nested,
-            max_workers=args.max_workers
-        )) - len(valid_slides)
-        if skipped:
-            print(f"[MAIN] Skipping {skipped} slide(s) with completed outputs.")
-        
-        if not valid_slides:
-            print('[MAIN] All requested work already complete. Nothing to process.')
-            return
-
-        warm = valid_slides[:args.cache_batch_size]
+        warm = pending_slides[:args.cache_batch_size]
         warmup_dir = os.path.join(args.wsi_cache, "batch_0")
         print(f"[MAIN] Warmup caching batch: {warmup_dir}")
         cache_batch(warm, warmup_dir)
@@ -384,9 +376,8 @@ def main() -> None:
             run_task(processor, args)
 
         producer = Thread(target=batch_producer, args=(
-            queue, valid_slides, args.cache_batch_size, args.cache_batch_size, args.wsi_cache
+            queue, pending_slides, args.cache_batch_size, args.cache_batch_size, args.wsi_cache
         ))
-
         consumer = Thread(target=batch_consumer, args=(
             queue, args.task, args.wsi_cache, processor_factory, run_task_fn
         ))
@@ -398,55 +389,25 @@ def main() -> None:
         consumer.join()
     else:
         # === Sequential mode ===
-        processor = initialize_processor(args)
-        tasks = ['seg', 'coords', 'feat'] if args.task == 'all' else [args.task]
+        # Write pending slides to temporary CSV
+        import csv
+        import tempfile
         
-        # Filter completed slides before processing
-        from trident.IO import collect_valid_slides
-        all_slides = collect_valid_slides(
-            wsi_dir=args.wsi_dir,
-            custom_list_path=args.custom_list_of_wsis,
-            wsi_ext=args.wsi_ext,
-            search_nested=args.search_nested,
-            max_workers=args.max_workers
-        )
-        print(f"[MAIN] Found {len(all_slides)} valid slides in {args.wsi_dir}.")
-        
-        pending_slides = filter_completed_slides(all_slides, args, tasks)
-        skipped = len(all_slides) - len(pending_slides)
-        if skipped:
-            print(f"[MAIN] Skipping {skipped} slide(s) with completed outputs.")
-        
-        if not pending_slides:
-            print('[MAIN] All requested work already complete. Nothing to process.')
-            return
-        
-        # Update processor to only process pending slides
-        if pending_slides != all_slides:
-            # Create a temporary CSV with pending slides only
-            import csv
-            import tempfile
-            temp_csv = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False, newline='')
-            writer = csv.writer(temp_csv)
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False, newline='') as f:
+            writer = csv.writer(f)
             writer.writerow(['wsi'])
-            for slide in pending_slides:
-                writer.writerow([slide])
-            temp_csv.close()
-            
-            # Re-initialize processor with filtered list
-            args.custom_list_of_wsis = temp_csv.name
+            writer.writerows([[slide] for slide in pending_slides])
+            temp_csv_path = f.name
+        
+        try:
+            args.custom_list_of_wsis = temp_csv_path
             processor = initialize_processor(args)
-        
-        for task_name in tasks:
-            args.task = task_name
-            run_task(processor, args)
-        
-        # Clean up temporary CSV if created
-        if pending_slides != all_slides and hasattr(args, 'custom_list_of_wsis'):
-            try:
-                os.unlink(temp_csv.name)
-            except:
-                pass
+            
+            for task_name in task_sequence:
+                args.task = task_name
+                run_task(processor, args)
+        finally:
+            os.unlink(temp_csv_path)
 
 
 if __name__ == "__main__":
