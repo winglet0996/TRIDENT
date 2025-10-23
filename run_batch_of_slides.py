@@ -8,8 +8,9 @@ python run_batch_of_slides.py --task all --wsi_dir output/wsis --job_dir output 
 """
 import os
 import argparse
+import shutil
 import torch
-from typing import Any
+from typing import Any, List, Sequence, Tuple, Optional
 
 from trident import Processor 
 from trident.patch_encoder_models import encoder_registry as patch_encoder_registry
@@ -140,6 +141,77 @@ def generate_help_text() -> str:
     return parser.format_help()
 
 
+def slide_outputs_complete(slide_path: str, args: argparse.Namespace, task_sequence: Sequence[str]) -> bool:
+    """Return True if all required outputs exist for the slide for the requested tasks."""
+    slide_stem = os.path.splitext(os.path.basename(slide_path))[0]
+    coords_dir = args.coords_dir or f'{args.mag}x_{args.patch_size}px_{args.overlap}px_overlap'
+
+    for task_name in task_sequence:
+        if task_name == 'seg':
+            if not os.path.exists(os.path.join(args.job_dir, 'contours', f'{slide_stem}.jpg')):
+                return False
+        elif task_name == 'coords':
+            if not os.path.exists(os.path.join(args.job_dir, coords_dir, 'patches', f'{slide_stem}_patches.h5')):
+                return False
+        elif task_name == 'feat':
+            # Check if feature file exists
+            if args.slide_encoder is None:
+                features_dir = os.path.join(args.job_dir, coords_dir, f'features_{args.patch_encoder}')
+            else:
+                features_dir = os.path.join(args.job_dir, coords_dir, f'slide_features_{args.slide_encoder}')
+            
+            if not features_dir or not os.path.isdir(features_dir):
+                return False
+            if not any(os.path.exists(os.path.join(features_dir, f'{slide_stem}.{ext}')) for ext in ('h5', 'pt')):
+                return False
+        else:
+            return False
+    return True
+
+
+def filter_completed_slides(slide_paths: List[str], args: argparse.Namespace, task_sequence: Sequence[str]) -> List[str]:
+    """Filter out slides whose outputs already exist for all requested tasks."""
+    return [slide for slide in slide_paths if not slide_outputs_complete(slide, args, task_sequence)]
+
+
+def cleanup_files(job_dir: str, cache_dir: Optional[str] = None) -> Tuple[int, int]:
+    """
+    Remove stale lock files and optionally clean cache directory.
+    
+    Returns
+    -------
+    Tuple[int, int]
+        Number of lock files removed and cache items removed.
+    """
+    # Remove lock files
+    lock_count = 0
+    if os.path.isdir(job_dir):
+        for root, _, files in os.walk(job_dir):
+            for filename in files:
+                if filename.endswith('.lock'):
+                    try:
+                        os.remove(os.path.join(root, filename))
+                        lock_count += 1
+                    except OSError:
+                        pass
+    
+    # Clean cache directory
+    cache_count = 0
+    if cache_dir and os.path.isdir(cache_dir):
+        for item in os.listdir(cache_dir):
+            item_path = os.path.join(cache_dir, item)
+            try:
+                if os.path.isdir(item_path):
+                    shutil.rmtree(item_path)
+                else:
+                    os.remove(item_path)
+                cache_count += 1
+            except OSError:
+                pass
+    
+    return lock_count, cache_count
+
+
 def initialize_processor(args: argparse.Namespace) -> Processor:
     """
     Initialize the Trident Processor with arguments set in `run_batch_of_slides`.
@@ -249,6 +321,13 @@ def main() -> None:
 
     args = parse_arguments()
     args.device = f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu'
+    
+    # Cleanup stale lock files and cache directory
+    lock_count, cache_count = cleanup_files(args.job_dir, args.wsi_cache)
+    if lock_count:
+        print(f"[MAIN] Cleared {lock_count} stale lock file(s) under {args.job_dir}.")
+    if cache_count:
+        print(f"[MAIN] Cleared {cache_count} item(s) from cache directory {args.wsi_cache}.")
 
     if args.wsi_cache:
         # === Parallel pipeline with caching ===
@@ -268,6 +347,23 @@ def main() -> None:
             max_workers=args.max_workers
         )
         print(f"[MAIN] Found {len(valid_slides)} valid slides in {args.wsi_dir}.")
+        
+        # Filter out completed slides
+        task_sequence = ['seg', 'coords', 'feat'] if args.task == 'all' else [args.task]
+        valid_slides = filter_completed_slides(valid_slides, args, task_sequence)
+        skipped = len(collect_valid_slides(
+            wsi_dir=args.wsi_dir,
+            custom_list_path=args.custom_list_of_wsis,
+            wsi_ext=args.wsi_ext,
+            search_nested=args.search_nested,
+            max_workers=args.max_workers
+        )) - len(valid_slides)
+        if skipped:
+            print(f"[MAIN] Skipping {skipped} slide(s) with completed outputs.")
+        
+        if not valid_slides:
+            print('[MAIN] All requested work already complete. Nothing to process.')
+            return
 
         warm = valid_slides[:args.cache_batch_size]
         warmup_dir = os.path.join(args.wsi_cache, "batch_0")
@@ -304,9 +400,53 @@ def main() -> None:
         # === Sequential mode ===
         processor = initialize_processor(args)
         tasks = ['seg', 'coords', 'feat'] if args.task == 'all' else [args.task]
+        
+        # Filter completed slides before processing
+        from trident.IO import collect_valid_slides
+        all_slides = collect_valid_slides(
+            wsi_dir=args.wsi_dir,
+            custom_list_path=args.custom_list_of_wsis,
+            wsi_ext=args.wsi_ext,
+            search_nested=args.search_nested,
+            max_workers=args.max_workers
+        )
+        print(f"[MAIN] Found {len(all_slides)} valid slides in {args.wsi_dir}.")
+        
+        pending_slides = filter_completed_slides(all_slides, args, tasks)
+        skipped = len(all_slides) - len(pending_slides)
+        if skipped:
+            print(f"[MAIN] Skipping {skipped} slide(s) with completed outputs.")
+        
+        if not pending_slides:
+            print('[MAIN] All requested work already complete. Nothing to process.')
+            return
+        
+        # Update processor to only process pending slides
+        if pending_slides != all_slides:
+            # Create a temporary CSV with pending slides only
+            import csv
+            import tempfile
+            temp_csv = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False, newline='')
+            writer = csv.writer(temp_csv)
+            writer.writerow(['wsi'])
+            for slide in pending_slides:
+                writer.writerow([slide])
+            temp_csv.close()
+            
+            # Re-initialize processor with filtered list
+            args.custom_list_of_wsis = temp_csv.name
+            processor = initialize_processor(args)
+        
         for task_name in tasks:
             args.task = task_name
             run_task(processor, args)
+        
+        # Clean up temporary CSV if created
+        if pending_slides != all_slides and hasattr(args, 'custom_list_of_wsis'):
+            try:
+                os.unlink(temp_csv.name)
+            except:
+                pass
 
 
 if __name__ == "__main__":
