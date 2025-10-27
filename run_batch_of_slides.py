@@ -12,6 +12,8 @@ import shutil
 import torch
 from typing import Any, List, Sequence, Tuple, Optional
 
+torch.multiprocessing.set_start_method('spawn', force=True)
+
 from trident import Processor 
 from trident.patch_encoder_models import encoder_registry as patch_encoder_registry
 from trident.slide_encoder_models import encoder_registry as slide_encoder_registry
